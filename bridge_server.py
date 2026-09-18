@@ -1,71 +1,62 @@
 """
-Puente TradingView -> BingX (cuenta DEMO / VST)  —  v2
+Puente TradingView -> BingX (cuenta DEMO / VST)  —  v3
 ========================================================
 
-Basado en tu bridge original para "Precision Sniper". Cambios en esta v2,
-pensados para "Bot Signals MZ" (que ya calcula tamaño de posición y
-apalancamiento dentro del propio indicador, en vez de usar un tamaño fijo):
+Cambio de esta v3 respecto a v2: el endpoint del webhook ahora responde a
+TradingView DE INMEDIATO ("queued") y recién después hace el trabajo real
+con la API de BingX en segundo plano (FastAPI BackgroundTasks).
 
-1. QTY y LEVERAGE ya NO son fijos por variable de entorno — se leen del
-   payload JSON que manda el indicador ("qty" y "leverage"), calculados por
-   el Position Sizing del indicador (cartera × riesgo% / distancia del SL).
-   ORDER_QUANTITY y DEFAULT_LEVERAGE quedan solo como fallback si algún
-   día llega una alerta vieja sin esos campos.
+Por qué: TradingView le da al webhook una ventana de tiempo bastante corta
+para responder. La v2 hacía hasta 5 llamadas SEGUIDAS a la API de BingX
+(cerrar posición previa, setear apalancamiento, abrir la entrada, poner el
+SL de emergencia, poner el TP1) ANTES de devolver la respuesta HTTP — si
+esas llamadas tardaban un poco (latencia normal de red/exchange), superaba
+el tiempo que tolera TradingView y la alerta se marcaba como
+"request took too long and timed out", aunque el bridge probablemente
+terminara el trabajo unos segundos después, ya demasiado tarde.
 
-2. STOP LOSS DE EMERGENCIA en vez de SL ajustado: el indicador ahora tiene
-   "Anti-Liquidation Stop Loss", que espera N barras antes de confirmar el
-   cierre por SL (para filtrar mechas). Eso significa que el SL "real" no
-   lo puede ejecutar el exchange al toque — lo decide el indicador y llega
-   después, vía el evento "sl_hit". Por eso:
-     - En BingX SOLO se deja puesto un stop MUY ALEJADO (EMERGENCY_SL_MULT
-       veces la distancia del SL real), que actúa como red de seguridad
-       pura ante un desastre (servidor caído, gap extremo) — no como el
-       SL normal del sistema.
-     - El cierre real, al nivel de SL que ves en el dashboard del
-       indicador, lo hace este bridge con una orden de mercado apenas
-       llega el evento "sl_hit" (que ya respeta la espera configurada).
+Con este cambio, el endpoint valida el secreto, parsea el JSON, hace
+validaciones básicas (todo instantáneo, sin llamadas de red) y encola el
+trabajo pesado — responde en milisegundos. Las órdenes en BingX se siguen
+colocando exactamente igual, solo que después de que TradingView ya recibió
+su "OK".
 
-3. Se agregó manejo real de los eventos "sl_hit" y "max_bars_exit": ambos
-   ahora cierran la posición en BingX con una orden de mercado y cancelan
-   las órdenes condicionales que quedaron colgando (el stop de emergencia
-   y el TP1). Antes estos eventos solo se registraban en el log y no hacían
-   nada — la posición se quedaba abierta en el exchange aunque el
-   indicador ya la diera por cerrada.
+CONTRAPARTIDA a tener en cuenta: como la respuesta HTTP ya no espera el
+resultado real de las órdenes, esa respuesta ya no te dice si la orden se
+ejecutó bien o mal — vas a tener que mirar los logs del servidor para eso
+(cada paso sigue logueado igual que antes), o el endpoint /health, que
+ahora también expone la última operación procesada por símbolo.
 
-4. FIX IMPORTANTE que encontré en tu código original: en modo hedge
-   (positionSide LONG/SHORT). una señal opuesta no cierra la posición
-   anterior — abre una posición independiente en el lado contrario, y te
-   quedarías con LONG y SHORT abiertos a la vez (según cómo BingX trate
-   ese neteo). Bot Signals MZ funciona "stop-and-reverse" (nunca más de un
-   trade a la vez), así que ahora, antes de abrir una entrada nueva, el
-   bridge cierra primero cualquier posición previa que tenga registrada
-   para ese símbolo.
+Todo lo demás es igual a v2:
+1. QTY y LEVERAGE se leen del payload ("qty", "leverage"), calculados por
+   el Position Sizing del indicador. ORDER_QUANTITY/DEFAULT_LEVERAGE son
+   solo fallback.
+2. SL de emergencia (EMERGENCY_SL_MULT × la distancia del SL real) en vez
+   del SL ajustado — el cierre real llega después, vía el evento "sl_hit"
+   (que ya respeta la espera de N barras del Anti-Liquidation SL).
+3. "sl_hit" y "max_bars_exit" cierran la posición a mercado y cancelan las
+   órdenes condicionales colgando (antes solo se logueaban).
+4. Antes de abrir una entrada nueva, cierra cualquier posición previa
+   registrada en ese símbolo (fix del modo hedge: una señal opuesta no
+   cierra sola la posición anterior).
 
-LIMITACIÓN A TENER EN CUENTA:
-- El registro de qué posición/órdenes hay abiertas vive en memoria
-  (OPEN_POSITIONS), no en un archivo ni base de datos. Si reiniciás el
-  servidor mientras hay un trade abierto, el bridge "olvida" los IDs de
-  las órdenes condicionales asociadas (la posición en sí sigue abierta en
-  BingX, solo se pierde la referencia para poder cancelarlas prolijamente
-  más adelante). Para una demo está bien: si esto pasa a needs de cuenta
-  real, conviene persistir OPEN_POSITIONS en algo simple como un archivo
-  JSON o SQLite.
-- Sigue usando SOLO TP1 como salida automática en el exchange (igual que
-  tu versión original) — el indicador además trackea TP2/TP3/trailing
-  para sus propias estadísticas de backtest, pero eso NO se refleja en la
-  posición real todavía. Si en algún momento querés que el exchange
-  también haga salidas parciales en TP2/TP3, avisame y lo armamos aparte
-  (implica partir la orden de entrada en tramos).
-- Los nombres exactos de parámetros de la API de BingX (positionSide,
-  stopPrice, reduceOnly, set_leverage) pueden variar según versión de
-  CCXT y el modo de tu cuenta (hedge vs one-way). Probá primero en DEMO
-  con cantidades chicas.
+LIMITACIONES (sin cambios respecto a v2):
+- OPEN_POSITIONS vive en memoria — se pierde si el servidor reinicia con
+  un trade abierto (la posición en BingX sigue abierta, solo se pierde la
+  referencia a sus órdenes condicionales).
+- Solo TP1 se refleja como salida automática real en el exchange — TP2/TP3
+  y el trailing del indicador hoy son solo para las estadísticas del
+  backtest.
+- Parámetros de la API de BingX (positionSide, stopPrice, set_leverage)
+  pueden variar según versión de CCXT y el modo de cuenta. Probá primero
+  en DEMO con cantidades chicas.
 """
 
 import os
+import time
 import logging
 from typing import Optional
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 import ccxt
 
 logging.basicConfig(level=logging.INFO)
@@ -78,16 +69,12 @@ WEBHOOK_SECRET = os.environ["WEBHOOK_SECRET"]          # tu propio secreto, inve
 BINGX_API_KEY = os.environ["BINGX_API_KEY"]
 BINGX_API_SECRET = os.environ["BINGX_API_SECRET"]
 
-# Fallbacks — solo se usan si una alerta llega sin "qty" / "leverage"
-# (por ejemplo, una alerta vieja o mal configurada).
+# Fallbacks — solo se usan si una alerta llega sin "qty" / "leverage".
 DEFAULT_QUANTITY = float(os.environ.get("ORDER_QUANTITY", "0.001"))
 DEFAULT_LEVERAGE = float(os.environ.get("DEFAULT_LEVERAGE", "1"))
 
 # Qué tan lejos, en múltiplos de la distancia del SL real, va el stop de
-# emergencia puesto en el exchange. 3.0 = tres veces más lejos que el SL
-# que ves en el indicador. Subilo si tu Anti-Liq Confirmation Bars es alto
-# (más tiempo de espera = más margen para que el precio se mueva mientras
-# tanto) y no querés que la emergencia se dispare antes de tiempo.
+# emergencia puesto en el exchange.
 EMERGENCY_SL_MULT = float(os.environ.get("EMERGENCY_SL_MULT", "3.0"))
 
 exchange = ccxt.bingx({
@@ -99,9 +86,11 @@ exchange = ccxt.bingx({
 exchange.set_sandbox_mode(True)  # <- clave: apunta al entorno demo/VST de BingX
 
 # Estado en memoria: qué hay abierto ahora mismo por símbolo.
-# {"BTC/USDT:USDT": {"position_side": "LONG", "qty": 0.01,
-#                     "sl_order_id": "...", "tp1_order_id": "..."}}
 OPEN_POSITIONS: dict[str, dict] = {}
+
+# Último resultado procesado por símbolo — para poder revisar qué pasó sin
+# tener que ir a buscar en los logs. Se pisa en cada evento nuevo.
+LAST_RESULT: dict[str, dict] = {}
 
 
 def to_bingx_symbol(tv_ticker: str) -> str:
@@ -115,6 +104,10 @@ def to_bingx_symbol(tv_ticker: str) -> str:
         coin = base[:-4]
         return f"{coin}/USDT:USDT"
     return base
+
+
+def _record_result(symbol: str, status: str, detail: dict) -> None:
+    LAST_RESULT[symbol] = {"status": status, "ts": time.time(), **detail}
 
 
 def cancel_order_safe(symbol: str, order_id: Optional[str], label: str) -> None:
@@ -157,126 +150,68 @@ def close_position_market(symbol: str, reason: str) -> Optional[dict]:
     return close_order
 
 
-@app.post("/webhook/{secret}")
-async def webhook(secret: str, request: Request):
-    if secret != WEBHOOK_SECRET:
-        raise HTTPException(status_code=403, detail="secreto inválido")
+# ══════════════════════════════════════════════════════════
+# TAREAS EN SEGUNDO PLANO — acá vive el trabajo "lento" (llamadas a BingX),
+# que ahora corre DESPUÉS de que el endpoint ya le respondió a TradingView.
+# ══════════════════════════════════════════════════════════
 
-    raw_body = await request.body()
+def process_close_event(symbol: str, event: str) -> None:
     try:
-        payload = await request.json()
-    except Exception:
-        # Causa más común: el indicador tiene "Webhook JSON Format" (grupo
-        # Alerts) en OFF, así que TradingView está mandando el texto legible
-        # para humanos en vez de JSON. Devolvemos un error claro en vez de
-        # un 500 pelado, para que se vea el motivo directo en el log de la
-        # alerta de TradingView.
-        log.error("Body no es JSON válido: %r", raw_body[:300])
-        raise HTTPException(
-            status_code=400,
-            detail="El body recibido no es JSON válido. Revisá que 'Webhook JSON Format' "
-                   "esté activado en el grupo Alerts del indicador.",
-        )
-    log.info("Payload recibido: %s", payload)
+        close_order = close_position_market(symbol, reason=event)
+        _record_result(symbol, "closed", {"event": event, "order_id": close_order.get("id") if close_order else None})
+    except Exception as e:
+        log.exception("Error cerrando posición por evento %s en %s", event, symbol)
+        _record_result(symbol, "error", {"event": event, "error": str(e)})
 
-    action = payload.get("action")
-    event = payload.get("event")
-    if "ticker" not in payload:
-        raise HTTPException(status_code=400, detail="Falta 'ticker' en el payload")
+
+def process_entry(payload: dict) -> None:
     symbol = to_bingx_symbol(payload["ticker"])
-
-    # ── Eventos de gestión de un trade YA abierto ──
-    # sl_hit: el Anti-Liquidation SL del indicador confirmó el cierre.
-    # max_bars_exit: se agotó el límite de "Max Bars in Trade".
-    # Ambos son cierres reales que el exchange no puede anticipar por su
-    # cuenta (uno depende de la espera de N barras, el otro es por tiempo),
-    # así que acá es donde el bridge tiene que actuar.
-    if event in ("sl_hit", "max_bars_exit"):
-        try:
-            close_position_market(symbol, reason=event)
-            return {"status": "closed", "event": event, "symbol": symbol}
-        except Exception as e:
-            log.exception("Error cerrando posición por evento %s", event)
-            raise HTTPException(status_code=500, detail=str(e))
-
-    # El resto de los eventos informativos (tp1_hit, tp2_hit, tp3_hit,
-    # sl_pending) todavía no disparan ninguna acción acá — el TP1 real ya
-    # lo maneja la orden condicional puesta en el exchange al abrir el
-    # trade, y tp2/tp3/sl_pending son solo para tu seguimiento visual /
-    # estadísticas por ahora.
-    if action not in ("buy", "sell"):
-        log.info("Evento informativo (sin acción): %s", payload.get("event"))
-        return {"status": "ignored", "payload": payload}
-
-    # ── Señal de entrada (buy/sell) ──
+    action = payload["action"]
     side = "buy" if action == "buy" else "sell"
     position_side = "LONG" if action == "buy" else "SHORT"
     exit_side = "sell" if action == "buy" else "buy"
 
-    entry_ref = float(payload["price"])   # precio de referencia al momento de la señal
-    sl = float(payload["sl"])
-    tp1 = float(payload["tp1"])
-    qty = float(payload.get("qty") or DEFAULT_QUANTITY)
-    leverage = float(payload.get("leverage") or DEFAULT_LEVERAGE)
+    try:
+        entry_ref = float(payload["price"])
+        sl = float(payload["sl"])
+        tp1 = float(payload["tp1"])
+        qty = float(payload.get("qty") or DEFAULT_QUANTITY)
+        leverage = float(payload.get("leverage") or DEFAULT_LEVERAGE)
 
-    if qty <= 0:
-        raise HTTPException(status_code=400, detail=f"qty inválida en el payload: {payload.get('qty')}")
+        if qty <= 0:
+            log.error("qty inválida en el payload (%s) — se aborta la entrada en %s", payload.get("qty"), symbol)
+            _record_result(symbol, "error", {"error": f"qty inválida: {payload.get('qty')}"})
+            return
 
-    # Si había una posición previa registrada en este símbolo (por ejemplo,
-    # un stop-and-reverse: la señal opuesta llegó ANTES que el evento de
-    # cierre correspondiente), cerrarla primero. En modo hedge, BingX no
-    # cierra sola una posición LONG solo porque abrís una SHORT nueva.
-    if symbol in OPEN_POSITIONS:
-        log.info("Había una posición previa registrada en %s — cerrándola antes de abrir la nueva.", symbol)
-        try:
+        # Si había una posición previa registrada en este símbolo (stop-and-
+        # reverse), cerrarla primero — en modo hedge, BingX no cierra sola
+        # una posición LONG solo porque abrís una SHORT nueva.
+        if symbol in OPEN_POSITIONS:
+            log.info("Había una posición previa registrada en %s — cerrándola antes de abrir la nueva.", symbol)
             close_position_market(symbol, reason="reversal")
+
+        # Apalancamiento — best effort.
+        try:
+            exchange.set_leverage(leverage, symbol, params={"side": position_side})
         except Exception as e:
-            log.exception("Error cerrando la posición previa antes de revertir")
-            raise HTTPException(status_code=500, detail=str(e))
+            log.warning("No se pudo setear apalancamiento (%sx) en %s: %s", leverage, symbol, e)
 
-    # Apalancamiento — best effort: algunos modos/cuentas usan otros
-    # parámetros (por ejemplo side=LONG/SHORT en hedge mode). Si falla,
-    # se loguea pero no se aborta la entrada (puede que ya esté seteado
-    # manualmente en la cuenta).
-    try:
-        exchange.set_leverage(leverage, symbol, params={"side": position_side})
-    except Exception as e:
-        log.warning("No se pudo setear apalancamiento (%sx) en %s: %s", leverage, symbol, e)
+        sl_distance = abs(entry_ref - sl)
+        emergency_sl = entry_ref - sl_distance * EMERGENCY_SL_MULT if action == "buy" else entry_ref + sl_distance * EMERGENCY_SL_MULT
 
-    # Distancia del SL real (la que calcula el indicador) → stop de
-    # emergencia EMERGENCY_SL_MULT veces más lejos, como red de seguridad.
-    sl_distance = abs(entry_ref - sl)
-    emergency_sl = entry_ref - sl_distance * EMERGENCY_SL_MULT if action == "buy" else entry_ref + sl_distance * EMERGENCY_SL_MULT
-
-    try:
         entry = exchange.create_order(
-            symbol=symbol,
-            type="market",
-            side=side,
-            amount=qty,
+            symbol=symbol, type="market", side=side, amount=qty,
             params={"positionSide": position_side},
         )
 
         stop_loss = exchange.create_order(
-            symbol=symbol,
-            type="stop_market",
-            side=exit_side,
-            amount=qty,
-            params={
-                "positionSide": position_side,
-                "stopPrice": emergency_sl,
-            },
+            symbol=symbol, type="stop_market", side=exit_side, amount=qty,
+            params={"positionSide": position_side, "stopPrice": emergency_sl},
         )
 
         take_profit = exchange.create_order(
-            symbol=symbol,
-            type="take_profit_market",
-            side=exit_side,
-            amount=qty,
-            params={
-                "positionSide": position_side,
-                "stopPrice": tp1,
-            },
+            symbol=symbol, type="take_profit_market", side=exit_side, amount=qty,
+            params={"positionSide": position_side, "stopPrice": tp1},
         )
 
         OPEN_POSITIONS[symbol] = {
@@ -291,8 +226,7 @@ async def webhook(secret: str, request: Request):
             entry.get("id"), qty, leverage, emergency_sl, sl, take_profit.get("id"),
         )
 
-        return {
-            "status": "ok",
+        _record_result(symbol, "ok", {
             "entry_order_id": entry.get("id"),
             "qty": qty,
             "leverage": leverage,
@@ -300,13 +234,63 @@ async def webhook(secret: str, request: Request):
             "real_sl_price": sl,
             "sl_order_id": stop_loss.get("id"),
             "tp1_order_id": take_profit.get("id"),
-        }
+        })
 
     except Exception as e:
-        log.exception("Error ejecutando la orden en BingX demo")
-        raise HTTPException(status_code=500, detail=str(e))
+        log.exception("Error ejecutando la orden en BingX demo (%s en %s)", action, symbol)
+        _record_result(symbol, "error", {"action": action, "error": str(e)})
+
+
+# ══════════════════════════════════════════════════════════
+# ENDPOINT — rápido: valida, parsea, encola. No espera a BingX.
+# ══════════════════════════════════════════════════════════
+
+@app.post("/webhook/{secret}")
+async def webhook(secret: str, request: Request, background_tasks: BackgroundTasks):
+    if secret != WEBHOOK_SECRET:
+        raise HTTPException(status_code=403, detail="secreto inválido")
+
+    raw_body = await request.body()
+    try:
+        payload = await request.json()
+    except Exception:
+        # Causa más común: "Webhook JSON Format" (grupo Alerts del
+        # indicador) está en OFF, así que llega texto plano en vez de JSON.
+        log.error("Body no es JSON válido: %r", raw_body[:300])
+        raise HTTPException(
+            status_code=400,
+            detail="El body recibido no es JSON válido. Revisá que 'Webhook JSON Format' "
+                   "esté activado en el grupo Alerts del indicador.",
+        )
+
+    if "ticker" not in payload:
+        raise HTTPException(status_code=400, detail="Falta 'ticker' en el payload")
+
+    log.info("Payload recibido: %s", payload)
+    action = payload.get("action")
+    event = payload.get("event")
+    symbol = to_bingx_symbol(payload["ticker"])
+
+    # sl_hit / max_bars_exit: cierre real de un trade ya abierto.
+    if event in ("sl_hit", "max_bars_exit"):
+        background_tasks.add_task(process_close_event, symbol, event)
+        return {"status": "queued", "event": event, "symbol": symbol}
+
+    # Eventos informativos (tp1_hit, tp2_hit, tp3_hit, sl_pending): por
+    # ahora no disparan ninguna acción, solo se registran.
+    if action not in ("buy", "sell"):
+        log.info("Evento informativo (sin acción): %s", event)
+        return {"status": "ignored", "payload": payload}
+
+    # Señal de entrada — se encola, la ejecución real pasa en segundo plano.
+    background_tasks.add_task(process_entry, payload)
+    return {"status": "queued", "action": action, "symbol": symbol}
 
 
 @app.get("/health")
 async def health():
-    return {"status": "up", "open_positions": list(OPEN_POSITIONS.keys())}
+    return {
+        "status": "up",
+        "open_positions": OPEN_POSITIONS,
+        "last_results": LAST_RESULT,
+    }
