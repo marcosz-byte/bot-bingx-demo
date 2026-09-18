@@ -162,11 +162,27 @@ async def webhook(secret: str, request: Request):
     if secret != WEBHOOK_SECRET:
         raise HTTPException(status_code=403, detail="secreto inválido")
 
-    payload = await request.json()
+    raw_body = await request.body()
+    try:
+        payload = await request.json()
+    except Exception:
+        # Causa más común: el indicador tiene "Webhook JSON Format" (grupo
+        # Alerts) en OFF, así que TradingView está mandando el texto legible
+        # para humanos en vez de JSON. Devolvemos un error claro en vez de
+        # un 500 pelado, para que se vea el motivo directo en el log de la
+        # alerta de TradingView.
+        log.error("Body no es JSON válido: %r", raw_body[:300])
+        raise HTTPException(
+            status_code=400,
+            detail="El body recibido no es JSON válido. Revisá que 'Webhook JSON Format' "
+                   "esté activado en el grupo Alerts del indicador.",
+        )
     log.info("Payload recibido: %s", payload)
 
     action = payload.get("action")
     event = payload.get("event")
+    if "ticker" not in payload:
+        raise HTTPException(status_code=400, detail="Falta 'ticker' en el payload")
     symbol = to_bingx_symbol(payload["ticker"])
 
     # ── Eventos de gestión de un trade YA abierto ──
