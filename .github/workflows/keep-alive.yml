@@ -29,4 +29,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Ping /health en el bridge
-        run: curl -fsS --max-time 20 https://bot-bingx-demo.onrender.com/health
+        # --max-time 60: le da margen a Render para levantar desde cero si
+        # justo este ping encuentra el servicio dormido (un cold start
+        # puede tardar 30-60s). Sin este margen, el propio curl se rendía
+        # antes de que Render terminara de arrancar, y eso se veía como un
+        # "failure" del workflow aunque Render no tuviera ningún problema.
+        run: curl -fsS --max-time 60 https://bot-bingx-demo.onrender.com/health
