@@ -1,0 +1,32 @@
+name: Keep BingX bridge awake
+
+# Le pega a /health cada 10 minutos para que Render (plan Free) no
+# duerma el servicio por inactividad. El plan Free hace spin-down a los
+# ~15 min sin tráfico HTTP entrante, así que un ping cada 10 min deja
+# margen aunque GitHub Actions demore un poco en disparar el cron.
+#
+# Instalación:
+# 1. En el repo que Render usa para deployar el bridge, creá la carpeta
+#    .github/workflows/ si no existe.
+# 2. Poné este archivo ahí como .github/workflows/keep-alive.yml
+# 3. Hacé commit y push — no necesitás tocar nada más en Render.
+# 4. (Opcional) En la pestaña "Actions" del repo en GitHub podés
+#    disparar un run manual ("Run workflow") para probarlo al toque en
+#    vez de esperar los 10 minutos.
+#
+# Nota: si el repo queda 60 días sin ningún commit, GitHub desactiva
+# los workflows programados automáticamente — no debería ser un
+# problema mientras el proyecto siga activo, pero si en algún momento
+# notás que el ping dejó de correr, un commit cualquiera lo reactiva.
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch: {}  # permite dispararlo a mano desde la pestaña Actions
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping /health en el bridge
+        run: curl -fsS --max-time 20 https://bot-bingx-demo.onrender.com/health
